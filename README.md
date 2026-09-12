@@ -191,3 +191,52 @@ xxd seng21213-os.img | grep -c aa55  # Verify boot signature
 ---
 
 *Happy hacking! Remember: every commercial OS started exactly like this.*
+
+---
+
+## Extensions (Bonus Marks)
+
+### Extension 1 — Command History Ring Buffer
+
+- **Lecture concept:** L02 §3 — circular buffer data structure
+- **What it does:** Up/Down arrow keys navigate the last 16 commands
+  typed at the shell. History is stored in a fixed-size ring buffer
+  (`history[HIST_LEN][HIST_MAX]`).
+- **How to test:**
+  1. Type four commands: `help`, `ps`, `meminfo`, `ls`.
+  2. Press **Up** arrow four times. The prompt recalls them in
+     reverse order: `ls`, `meminfo`, `ps`, `help`.
+  3. Press **Down** arrow to walk forward through the history.
+  4. Type `history` to print all stored commands.
+- **Files:** `kernel/kernel.c` (ring buffer + custom `shell_readline`),
+  `kernel/keyboard.c` (arrow scancodes 0x48 / 0x50),
+  `kernel/keyboard.h` (`KEY_UP`, `KEY_DOWN`).
+
+### Extension 2 — `sleep(ms)` Sorted Wake Queue
+
+- **Lecture concept:** L09 §3 — process state transitions
+  (RUNNING → BLOCKED → READY)
+- **What it does:** `sleep_ms(n)` blocks the calling thread for at
+  least n milliseconds. A sorted linked list of `(pcb, wake_tick)`
+  entries is checked on every IRQ0 tick (100 Hz). When the deadline
+  passes, the blocked PCB moves back to READY.
+- **How to test:** At the shell, run `demo_sleep`. Two threads sleep
+  for 500 ms and 250 ms respectively, printing interleaved `A`/`B`
+  characters. Both are truly blocked (not busy-waiting) and wake on
+  schedule. Completes in ~2.5 seconds.
+- **Files:** `kernel/scheduler.c` (`sleep_ms`, `check_sleepers`,
+  `tick_count`), `kernel/scheduler.h`.
+
+### Extension 3 — Single-Indirect Block Pointer
+
+- **Lecture concept:** L12 §2 — i-node indirection
+- **What it does:** Each inode gains one indirect block pointer,
+  raising the per-file maximum from 32 KB (8 direct × 4 KB) to
+  4 MB + 32 KB (8 direct + 1024 indirect × 4 KB).
+- **How to test:** At the shell, run `demo_large`. It writes 40 KB
+  into `large.bin` — past the 8-direct-block limit — forcing the
+  FS to allocate the indirect block. `ls` then shows
+  `large.bin  40960 bytes`.
+- **Files:** `kernel/fs.c` (`resolve_block`, updated `fs_read` /
+  `fs_write` / `fs_unlink`), `kernel/fs.h` (`indirect` field in
+  `fs_inode_t`).

@@ -1,4 +1,5 @@
-/* SENG21213-OS :: RAM disk file system — L12 §2–3 */
+/* SENG21213-OS :: RAM disk file system
+ * Extension: single-indirect block pointer (L12 section 2) */
 #include "fs.h"
 #include "ramdisk.h"
 
@@ -7,7 +8,6 @@ static fs_inode_t      inodes[FS_MAX_INODES];
 static uint8_t         block_bitmap[FS_BLOCKS / 8];
 static fs_dirent_t     dir_cache[FS_MAX_FILES];
 
-/* ---- bitmap helpers ---- */
 static int  blk_used(uint32_t b)  { return (block_bitmap[b >> 3] >> (b & 7)) & 1; }
 static void blk_mark(uint32_t b)  { block_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7)); }
 static void blk_clear(uint32_t b) { block_bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7)); }
@@ -24,13 +24,13 @@ static int alloc_inode(void) {
             inodes[i].used = 1;
             inodes[i].size = 0;
             for (int k = 0; k < FS_DIRECT_BLOCKS; k++) inodes[i].blocks[k] = 0;
+            inodes[i].indirect = 0;
             return i;
         }
     }
     return -1;
 }
 
-/* ---- directory load/save (mirrors block 1) ---- */
 static void dir_save(void) {
     uint8_t *blk = ramdisk_direct(1);
     for (uint32_t i = 0; i < sizeof(dir_cache); i++)
@@ -63,14 +63,42 @@ static int dir_find(const char *name) {
     return -1;
 }
 
-/* ---- public API ---- */
+static uint32_t resolve_block(fs_inode_t *n, uint32_t blk_idx, int alloc) {
+    if (blk_idx < FS_DIRECT_BLOCKS) {
+        if (n->blocks[blk_idx] == 0) {
+            if (!alloc) return 0;
+            int b = alloc_block();
+            if (b < 0) return 0;
+            n->blocks[blk_idx] = (uint32_t)b;
+        }
+        return n->blocks[blk_idx];
+    }
+    uint32_t ind_idx = blk_idx - FS_DIRECT_BLOCKS;
+    if (ind_idx >= FS_INDIRECT_PER_BLOCK) return 0;
+    if (n->indirect == 0) {
+        if (!alloc) return 0;
+        int b = alloc_block();
+        if (b < 0) return 0;
+        n->indirect = (uint32_t)b;
+        uint8_t *z = ramdisk_direct(n->indirect);
+        for (uint32_t k = 0; k < FS_BLOCK_SIZE; k++) z[k] = 0;
+    }
+    uint32_t *ind = (uint32_t *)ramdisk_direct(n->indirect);
+    if (ind[ind_idx] == 0) {
+        if (!alloc) return 0;
+        int b = alloc_block();
+        if (b < 0) return 0;
+        ind[ind_idx] = (uint32_t)b;
+    }
+    return ind[ind_idx];
+}
+
 void fs_format(void) {
     sb.magic       = FS_MAGIC;
     sb.block_count = FS_BLOCKS;
     sb.inode_count = FS_MAX_INODES;
     sb.data_start  = FS_DATA_START;
 
-    /* bitmap: blocks 0,1,2 reserved (superblock, dir, bitmap) */
     for (uint32_t i = 0; i < sizeof(block_bitmap); i++) block_bitmap[i] = 0;
     blk_mark(0); blk_mark(1); blk_mark(2);
 
@@ -78,15 +106,15 @@ void fs_format(void) {
         inodes[i].used = 0;
         inodes[i].size = 0;
         for (int k = 0; k < FS_DIRECT_BLOCKS; k++) inodes[i].blocks[k] = 0;
+        inodes[i].indirect = 0;
     }
-    inodes[0].used = 1;   /* inode 0 reserved */
+    inodes[0].used = 1;
 
     for (int i = 0; i < FS_MAX_FILES; i++) {
         for (int k = 0; k < FS_MAX_NAME; k++) dir_cache[i].name[k] = 0;
         dir_cache[i].inode = 0;
     }
 
-    /* write superblock + directory to disk */
     uint8_t *sbblk = ramdisk_direct(0);
     uint8_t *s = (uint8_t *)&sb;
     for (uint32_t i = 0; i < sizeof(sb); i++) sbblk[i] = s[i];
@@ -98,11 +126,8 @@ void fs_init(void) {
     uint8_t *s = (uint8_t *)&sb;
     for (uint32_t i = 0; i < sizeof(sb); i++) s[i] = sbblk[i];
 
-    if (sb.magic != FS_MAGIC || sb.block_count != FS_BLOCKS) {
-        fs_format();
-    } else {
-        dir_load();
-    }
+    if (sb.magic != FS_MAGIC || sb.block_count != FS_BLOCKS) fs_format();
+    else dir_load();
 }
 
 int fs_create(const char *name) {
@@ -111,10 +136,8 @@ int fs_create(const char *name) {
     for (int i = 0; i < FS_MAX_FILES; i++)
         if (dir_cache[i].inode == 0) { slot = i; break; }
     if (slot < 0) return -1;
-
     int ino = alloc_inode();
     if (ino < 0) return -1;
-
     str_copy(dir_cache[slot].name, name, FS_MAX_NAME);
     dir_cache[slot].inode = (uint32_t)ino;
     dir_save();
@@ -130,20 +153,13 @@ int fs_write(int ino, const void *buf, uint32_t len) {
     if (ino <= 0 || ino >= FS_MAX_INODES || !inodes[ino].used) return -1;
     fs_inode_t *n = &inodes[ino];
     const uint8_t *p = (const uint8_t *)buf;
-
     uint32_t written = 0;
     while (written < len) {
         uint32_t blk_idx = (n->size + written) / FS_BLOCK_SIZE;
         uint32_t off     = (n->size + written) % FS_BLOCK_SIZE;
-        if (blk_idx >= FS_DIRECT_BLOCKS) break;   /* file size cap */
-
-        if (n->blocks[blk_idx] == 0) {
-            int b = alloc_block();
-            if (b < 0) break;
-            n->blocks[blk_idx] = (uint32_t)b;
-        }
-        uint8_t *d = ramdisk_direct(n->blocks[blk_idx]);
-
+        uint32_t phys = resolve_block(n, blk_idx, 1);
+        if (phys == 0) break;
+        uint8_t *d = ramdisk_direct(phys);
         uint32_t chunk = FS_BLOCK_SIZE - off;
         if (chunk > len - written) chunk = len - written;
         for (uint32_t k = 0; k < chunk; k++) d[off + k] = p[written + k];
@@ -158,14 +174,14 @@ int fs_read(int ino, void *buf, uint32_t maxlen) {
     fs_inode_t *n = &inodes[ino];
     uint32_t len = n->size;
     if (len > maxlen) len = maxlen;
-
     uint8_t *p = (uint8_t *)buf;
     uint32_t done = 0;
     while (done < len) {
         uint32_t blk = done / FS_BLOCK_SIZE;
         uint32_t off = done % FS_BLOCK_SIZE;
-        if (n->blocks[blk] == 0) break;
-        uint8_t *d = ramdisk_direct(n->blocks[blk]);
+        uint32_t phys = resolve_block(n, blk, 0);
+        if (phys == 0) break;
+        uint8_t *d = ramdisk_direct(phys);
         uint32_t chunk = FS_BLOCK_SIZE - off;
         if (chunk > len - done) chunk = len - done;
         for (uint32_t k = 0; k < chunk; k++) p[done + k] = d[off + k];
@@ -179,14 +195,19 @@ int fs_unlink(const char *name) {
     if (s < 0) return -1;
     int ino = (int)dir_cache[s].inode;
     if (ino <= 0 || ino >= FS_MAX_INODES) return -1;
-
     fs_inode_t *n = &inodes[ino];
     for (int i = 0; i < FS_DIRECT_BLOCKS; i++) {
         if (n->blocks[i]) { blk_clear(n->blocks[i]); n->blocks[i] = 0; }
     }
+    if (n->indirect) {
+        uint32_t *ind = (uint32_t *)ramdisk_direct(n->indirect);
+        for (uint32_t k = 0; k < FS_INDIRECT_PER_BLOCK; k++)
+            if (ind[k]) blk_clear(ind[k]);
+        blk_clear(n->indirect);
+        n->indirect = 0;
+    }
     n->used = 0;
     n->size = 0;
-
     for (int k = 0; k < FS_MAX_NAME; k++) dir_cache[s].name[k] = 0;
     dir_cache[s].inode = 0;
     dir_save();

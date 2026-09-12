@@ -1,6 +1,5 @@
-/* SENG21213-OS :: Round-robin scheduler — L09 §3–4
- * Fixed: disable IRQs during the critical context-switch section
- * to prevent reentrant scheduler_tick() calls. */
+/* SENG21213-OS :: Round-robin scheduler
+ * Extension: sleep_ms() with sorted wake-tick list (L09 section 3) */
 #include "scheduler.h"
 #include "idt.h"
 #include "pic.h"
@@ -19,6 +18,60 @@ void scheduler_init(void) {
     __asm__ __volatile__("sti");
 }
 
+/* ---- Extension: sleep queue ---- */
+static volatile uint32_t tick_count = 0;
+
+typedef struct sleeper {
+    pcb_t          *p;
+    uint32_t        wake_tick;
+    struct sleeper *next;
+} sleeper_t;
+
+static sleeper_t  sleepers[MAX_PROCS];
+static sleeper_t *sleep_head = 0;
+
+void sleep_ms(uint32_t ms) {
+    if (ms == 0) { yield(); return; }
+
+    cli_();
+    pcb_t *cur = get_current();
+    if (!cur) { sti_(); return; }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_PROCS; i++) if (!sleepers[i].p) { slot = i; break; }
+    if (slot < 0) { sti_(); return; }
+
+    sleeper_t *s = &sleepers[slot];
+    s->p = cur;
+    s->wake_tick = tick_count + (ms + 9) / 10;
+    s->next = 0;
+
+    cur->state = PROC_BLOCKED;
+
+    if (!sleep_head || s->wake_tick < sleep_head->wake_tick) {
+        s->next = sleep_head;
+        sleep_head = s;
+    } else {
+        sleeper_t *t = sleep_head;
+        while (t->next && t->next->wake_tick <= s->wake_tick) t = t->next;
+        s->next = t->next;
+        t->next = s;
+    }
+    sti_();
+    yield();
+}
+
+static void check_sleepers(void) {
+    while (sleep_head && sleep_head->wake_tick <= tick_count) {
+        sleeper_t *s = sleep_head;
+        sleep_head = s->next;
+        if (s->p && s->p->state == PROC_BLOCKED) s->p->state = PROC_READY;
+        s->p = 0;
+        s->next = 0;
+    }
+}
+/* ---- end extension ---- */
+
 static pcb_t *pick_next(pcb_t *cur) {
     if (!cur) return 0;
     pcb_t *n = cur->next;
@@ -31,7 +84,7 @@ static pcb_t *pick_next(pcb_t *cur) {
 }
 
 void scheduler_tick(void) {
-    cli_();                              /* critical section start */
+    cli_();
     pcb_t *cur = get_current();
     if (!cur) { sti_(); return; }
     pcb_t *next = pick_next(cur);
@@ -42,8 +95,6 @@ void scheduler_tick(void) {
     set_current(next);
 
     switch_context(&cur->esp, next->esp);
-
-    /* Resumed: re-enable IRQs on our stack */
     sti_();
 }
 
@@ -51,5 +102,7 @@ void yield(void) { scheduler_tick(); }
 
 void irq0_handler(void) {
     pic_send_eoi(0);
+    tick_count++;
+    check_sleepers();
     scheduler_tick();
 }
