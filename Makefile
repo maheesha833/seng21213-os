@@ -34,7 +34,10 @@ KERNEL_C_SRCS  := kernel/kernel.c     \
                    kernel/pic.c       \
                    kernel/pit.c       \
                    kernel/process.c   \
-                   kernel/scheduler.c
+                   kernel/scheduler.c \
+                   kernel/thread.c    \
+                   kernel/mutex.c     \
+                   kernel/semaphore.c
 
 KERNEL_C_OBJS  := $(patsubst kernel/%.c, build/%.o, $(KERNEL_C_SRCS))
 KERNEL_ELF     := build/kernel.elf

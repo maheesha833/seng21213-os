@@ -1,9 +1,16 @@
+/* SENG21213-OS :: Round-robin scheduler — L09 §3–4
+ * Fixed: disable IRQs during the critical context-switch section
+ * to prevent reentrant scheduler_tick() calls. */
 #include "scheduler.h"
 #include "idt.h"
 #include "pic.h"
 #include "pit.h"
+
 extern void switch_context(uint32_t *old_esp, uint32_t new_esp);
 void irq0_handler(void);
+
+static inline void cli_(void) { __asm__ __volatile__("cli" ::: "memory"); }
+static inline void sti_(void) { __asm__ __volatile__("sti" ::: "memory"); }
 
 void scheduler_init(void) {
     pic_remap();
@@ -24,14 +31,20 @@ static pcb_t *pick_next(pcb_t *cur) {
 }
 
 void scheduler_tick(void) {
+    cli_();                              /* critical section start */
     pcb_t *cur = get_current();
-    if (!cur) return;
+    if (!cur) { sti_(); return; }
     pcb_t *next = pick_next(cur);
-    if (!next) return;
+    if (!next) { sti_(); return; }
+
     if (cur->state == PROC_RUNNING) cur->state = PROC_READY;
     next->state = PROC_RUNNING;
     set_current(next);
+
     switch_context(&cur->esp, next->esp);
+
+    /* Resumed: re-enable IRQs on our stack */
+    sti_();
 }
 
 void yield(void) { scheduler_tick(); }
