@@ -1,5 +1,5 @@
 /* =============================================================================
- * SENG21213-OS :: Main Kernel (Stage 0 + 1 + 2 + 3)
+ * SENG21213-OS :: Main Kernel (Stage 0 + 1 + 2 + 3 + 4)
  * ============================================================================*/
 #include "vga.h"
 #include "keyboard.h"
@@ -9,6 +9,8 @@
 #include "mutex.h"
 #include "semaphore.h"
 #include "pmm.h"
+#include "ramdisk.h"
+#include "fs.h"
 #include "../include/types.h"
 
 static void cmd_help(void);
@@ -21,17 +23,28 @@ static void cmd_race(void);
 static void cmd_pc(void);
 static void cmd_meminfo(void);
 static void cmd_memtest(void);
+static void cmd_ls(void);
+static void cmd_touch(const char *name);
+static void cmd_cat(const char *name);
+static void cmd_write(const char *name, const char *text);
+static void cmd_rm(const char *name);
 
+/* ---- string helpers ---- */
 static int k_strcmp(const char *a, const char *b) {
     while (*a && (*a == *b)) { a++; b++; }
     return (uint8_t)*a - (uint8_t)*b;
 }
-static int k_strncmp(const char *a, const char *b, size_t n) {
+static int __attribute__((unused)) k_strncmp(const char *a, const char *b, size_t n) {
     while (n-- && *a && (*a == *b)) { a++; b++; }
     return n == (size_t)-1 ? 0 : (uint8_t)*a - (uint8_t)*b;
 }
 static size_t k_strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 static const char *k_ltrim(const char *s) { while (*s == ' ') s++; return s; }
+static void __attribute__((unused)) k_strncpy0(char *dst, const char *src, size_t maxlen) {
+    size_t i = 0;
+    while (i < maxlen - 1 && src[i]) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
 
 static void cmd_ps(void) {
     vga_puts("\n  PID   STATE     NAME\n");
@@ -50,19 +63,13 @@ static mutex_t      glock;
 
 static void racer_unsafe(void *arg) {
     (void)arg;
-    for (int i = 0; i < 50000; i++) {
-        int tmp = myglobal;
-        yield();
-        myglobal = tmp + 1;
-    }
+    for (int i = 0; i < 50000; i++) { int t = myglobal; yield(); myglobal = t + 1; }
 }
 static void racer_safe(void *arg) {
     (void)arg;
     for (int i = 0; i < 50000; i++) {
         mutex_lock(&glock);
-        int tmp = myglobal;
-        yield();
-        myglobal = tmp + 1;
+        int t = myglobal; yield(); myglobal = t + 1;
         mutex_unlock(&glock);
     }
 }
@@ -90,24 +97,18 @@ static semaphore_t  sem_empty, sem_full, sem_mutex;
 static void producer(void *arg) {
     (void)arg;
     for (int i = 0; i < 1000; i++) {
-        sem_wait(&sem_empty);
-        sem_wait(&sem_mutex);
-        buf[buf_head] = i;
-        buf_head = (buf_head + 1) % BUF_N;
-        sem_signal(&sem_mutex);
-        sem_signal(&sem_full);
+        sem_wait(&sem_empty); sem_wait(&sem_mutex);
+        buf[buf_head] = i; buf_head = (buf_head + 1) % BUF_N;
+        sem_signal(&sem_mutex); sem_signal(&sem_full);
     }
 }
 static void consumer(void *arg) {
     (void)arg;
     int sum = 0;
     for (int i = 0; i < 1000; i++) {
-        sem_wait(&sem_full);
-        sem_wait(&sem_mutex);
-        sum += buf[buf_tail];
-        buf_tail = (buf_tail + 1) % BUF_N;
-        sem_signal(&sem_mutex);
-        sem_signal(&sem_empty);
+        sem_wait(&sem_full); sem_wait(&sem_mutex);
+        sum += buf[buf_tail]; buf_tail = (buf_tail + 1) % BUF_N;
+        sem_signal(&sem_mutex); sem_signal(&sem_empty);
     }
     vga_printf("\n  Producer-consumer: sum = %d  (expected 499500)\n", sum);
 }
@@ -150,13 +151,72 @@ static void cmd_memtest(void) {
     uint32_t after_alloc = pmm_free_frames();
     vga_printf("  Free before: %u, after alloc: %u (diff %d)\n",
                before, after_alloc, (int)(before - after_alloc));
-
     for (int i = 0; i < 100; i++) pmm_free_frame(frames[i]);
     uint32_t after_free = pmm_free_frames();
     vga_printf("  Free after free: %u\n", after_free);
-
     if (after_free == before) vga_puts("  [OK] No leak detected\n\n");
     else                     vga_puts("  [FAIL] Leak detected!\n\n");
+}
+
+/* --- L12 File System --- */
+static void cmd_ls(void) {
+    char names[FS_MAX_FILES][FS_MAX_NAME];
+    int n = fs_list(names, FS_MAX_FILES);
+    vga_puts("\n  Files on RAM disk:\n");
+    if (n == 0) {
+        vga_puts("  (none)\n\n");
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        int ino = fs_open(names[i]);
+        vga_puts("  ");
+        vga_puts(names[i]);
+        int len = 0;
+        while (names[i][len]) len++;
+        for (int k = len; k < 28; k++) vga_putchar(' ');
+        vga_puts("  ");
+        vga_printf("%u bytes\n", fs_size(ino));
+    }
+    vga_puts("\n");
+}
+
+static void cmd_touch(const char *name) {
+    int ino = fs_create(name);
+    if (ino < 0) vga_puts("  touch: file already exists or disk full\n");
+    else         vga_printf("  created '%s' (inode %d)\n", name, ino);
+}
+
+static void cmd_cat(const char *name) {
+    int ino = fs_open(name);
+    if (ino < 0) { vga_puts("  cat: no such file\n"); return; }
+    char buf[256];
+    int total = 0;
+    vga_puts("  ");
+    int n;
+    while ((n = fs_read(ino, buf, sizeof(buf))) > 0 && total < (int)fs_size(ino)) {
+        for (int i = 0; i < n; i++) vga_putchar(buf[i]);
+        total += n;
+        if (n < (int)sizeof(buf)) break;
+    }
+    vga_putchar('\n');
+}
+
+static void cmd_write(const char *name, const char *text) {
+    int ino = fs_open(name);
+    if (ino < 0) ino = fs_create(name);
+    if (ino < 0) { vga_puts("  write: cannot create file\n"); return; }
+
+    /* Compute length (up to a newline) */
+    int len = 0;
+    while (text[len]) len++;
+    fs_write(ino, text, len);
+    fs_write(ino, "\n", 1);
+    vga_printf("  wrote %d bytes to '%s'\n", len + 1, name);
+}
+
+static void cmd_rm(const char *name) {
+    if (fs_unlink(name) < 0) vga_puts("  rm: no such file\n");
+    else                     vga_printf("  removed '%s'\n", name);
 }
 
 /* --- splash / help --- */
@@ -166,53 +226,78 @@ static void print_splash(void) {
     vga_set_cursor(1, 2);
     vga_puts_color("  SENG21213-OS  |  Computer Architecture & Operating Systems", VGA_YELLOW, VGA_BLACK);
     vga_set_cursor(2, 2);
-    vga_puts_color("  Stage 3: Physical Memory Manager", VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts_color("  Stage 4: RAM Disk File System", VGA_LIGHT_CYAN, VGA_BLACK);
     vga_set_cursor(3, 2);
     vga_puts_color("  Department of Software Engineering", VGA_LIGHT_GREY, VGA_BLACK);
     vga_set_cursor(4, 2);
-    vga_puts_color("  Try: meminfo, memtest, ps, demo_race, demo_pc", VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts_color("  Try: help, ls, touch, write, cat, rm", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_set_cursor(5, 2);
-    vga_puts_color("  CPU: i686 | PIT: 100Hz | Round-Robin | Bitmap PMM", VGA_DARK_GREY, VGA_BLACK);
+    vga_puts_color("  CPU: i686 | PIT: 100Hz | PMM | RAM-disk FS", VGA_DARK_GREY, VGA_BLACK);
     vga_set_cursor(8, 0);
     vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
-    vga_puts("  Type 'meminfo' to view total/used/free physical frames.\n");
-    vga_puts("  Type 'memtest' to allocate and free 100 frames.\n\n");
+    vga_puts("  Type 'ls' to list files, or 'help' for all commands.\n\n");
 }
 
 static void cmd_help(void) {
     vga_puts_color("\n  SENG21213-OS Shell Commands\n", VGA_YELLOW, VGA_BLACK);
     vga_puts("  --------------------------------\n");
-    vga_puts("  help       - Show this help message\n");
-    vga_puts("  clear      - Clear the screen\n");
-    vga_puts("  about      - About this OS\n");
-    vga_puts("  echo       - Echo text\n");
-    vga_puts("  mem        - Memory map (stub)\n");
-    vga_puts("  ps         - [L09] List processes\n");
-    vga_puts("  demo_race  - [L10] Race with/without mutex\n");
-    vga_puts("  demo_pc    - [L10] Producer-consumer\n");
-    vga_puts("  meminfo    - [L11] Physical memory totals\n");
-    vga_puts("  memtest    - [L11] Allocate/free 100 frames\n\n");
+    vga_puts("  help                 - This help\n");
+    vga_puts("  clear                - Clear screen\n");
+    vga_puts("  about / mem          - About / memory map\n");
+    vga_puts("  ps                   - [L09] List processes\n");
+    vga_puts("  demo_race / demo_pc  - [L10] Concurrency demos\n");
+    vga_puts("  meminfo / memtest    - [L11] PMM info & stress test\n");
+    vga_puts("  ls                   - [L12] List files\n");
+    vga_puts("  touch <name>         - [L12] Create empty file\n");
+    vga_puts("  write <name> <text>  - [L12] Append text\n");
+    vga_puts("  cat <name>           - [L12] Print file contents\n");
+    vga_puts("  rm <name>            - [L12] Delete file\n\n");
 }
 static void cmd_clear(void) { vga_clear(VGA_BLACK); }
 static void cmd_about(void) { vga_puts("\n  SENG21213-OS - x86 i686, freestanding C, QEMU\n\n"); }
 static void cmd_echo(const char *args) { vga_puts("  "); vga_puts(args); vga_puts("\n"); }
 static void cmd_mem(void) {
-    vga_puts("\n  Static memory map\n");
-    vga_puts("  0x00000000 - 0x000FFFFF  first 1 MB (BIOS, VGA, kernel)\n");
-    vga_puts("  0x00100000 - ...         usable RAM (managed by PMM)\n");
-    vga_puts("  Use 'meminfo' for live totals.\n\n");
+    vga_puts("\n  Memory map: use 'meminfo' for PMM totals.\n\n");
 }
 
 static char shell_buf[256];
+static char arg1[64];
+static char arg2[160];
 static char prompt[] = "ksh> ";
 
+/* Very simple command line parser: splits on spaces.
+ *   cmd    = first word
+ *   arg1   = second word (if present)
+ *   arg2   = rest of line after arg1 (for 'write <name> <text>')
+ */
+static void parse_line(const char *line, char *cmd, char *a1, char *a2) {
+    const char *p = k_ltrim(line);
+    int i = 0;
+    while (p[i] && p[i] != ' ' && i < 63) { cmd[i] = p[i]; i++; }
+    cmd[i] = 0;
+    while (p[i] == ' ') i++;
+
+    int j = 0;
+    while (p[i] && p[i] != ' ' && j < 63) { a1[j++] = p[i++]; }
+    a1[j] = 0;
+    while (p[i] == ' ') i++;
+
+    int k = 0;
+    while (p[i] && k < 159) { a2[k++] = p[i++]; }
+    a2[k] = 0;
+}
+
 static void shell_run(void) {
+    static char cmd[64];
     vga_puts_color("\n  Kernel Shell ready.\n\n", VGA_LIGHT_GREEN, VGA_BLACK);
     for (;;) {
         vga_puts_color(prompt, VGA_LIGHT_GREEN, VGA_BLACK);
         kb_readline(shell_buf, sizeof(shell_buf));
-        const char *cmd = k_ltrim(shell_buf);
+
+        parse_line(shell_buf, cmd, arg1, arg2);
+
         if (k_strlen(cmd) == 0) continue;
+
         if (k_strcmp(cmd, "help")      == 0) { cmd_help();    continue; }
         if (k_strcmp(cmd, "clear")     == 0) { cmd_clear();   continue; }
         if (k_strcmp(cmd, "about")     == 0) { cmd_about();   continue; }
@@ -222,7 +307,27 @@ static void shell_run(void) {
         if (k_strcmp(cmd, "demo_pc")   == 0) { cmd_pc();      continue; }
         if (k_strcmp(cmd, "meminfo")   == 0) { cmd_meminfo(); continue; }
         if (k_strcmp(cmd, "memtest")   == 0) { cmd_memtest(); continue; }
-        if (k_strncmp(cmd, "echo ", 5) == 0) { cmd_echo(k_ltrim(cmd + 5)); continue; }
+        if (k_strcmp(cmd, "ls")        == 0) { cmd_ls();      continue; }
+        if (k_strcmp(cmd, "touch")     == 0) {
+            if (arg1[0] == 0) { vga_puts("  usage: touch <name>\n"); continue; }
+            cmd_touch(arg1); continue;
+        }
+        if (k_strcmp(cmd, "cat")       == 0) {
+            if (arg1[0] == 0) { vga_puts("  usage: cat <name>\n"); continue; }
+            cmd_cat(arg1); continue;
+        }
+        if (k_strcmp(cmd, "write")     == 0) {
+            if (arg1[0] == 0 || arg2[0] == 0) {
+                vga_puts("  usage: write <name> <text>\n"); continue;
+            }
+            cmd_write(arg1, arg2); continue;
+        }
+        if (k_strcmp(cmd, "rm")        == 0) {
+            if (arg1[0] == 0) { vga_puts("  usage: rm <name>\n"); continue; }
+            cmd_rm(arg1); continue;
+        }
+        if (k_strcmp(cmd, "echo")      == 0) { cmd_echo(arg1); continue; }
+
         vga_puts_color("  Unknown command. Try 'help'.\n", VGA_LIGHT_RED, VGA_BLACK);
     }
 }
@@ -234,6 +339,7 @@ void kernel_main(void) {
 
     process_init();
     pmm_init();
+    fs_init();
 
     static pcb_t shell_pcb;
     shell_pcb.pid       = 100;
